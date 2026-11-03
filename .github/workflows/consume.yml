@@ -1,0 +1,84 @@
+name: Synchronize a data product
+on:
+  workflow_call:
+    inputs:
+      kind:
+        required: true
+        type: string
+      producer_ref:
+        required: true
+        type: string
+      force:
+        required: false
+        type: boolean
+        default: false
+      publish:
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: write
+jobs:
+  synchronize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Probe version records before checking out data
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ inputs.kind }}
+          FORCE: ${{ inputs.force }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          python - <<'PYTHON'
+          import base64, json, os, subprocess
+          from urllib.request import Request, urlopen
+          encoded = subprocess.check_output(["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/contents/manifest.json", "--jq", ".content"])
+          manifest = json.loads(base64.b64decode(encoded))
+          changed = os.environ["FORCE"] == "true"
+          for server in ["jp", "intl"]:
+              url = f"https://raw.githubusercontent.com/haneoka-gakuen/haneoka/companion-feeds/{server}.json"
+              with urlopen(Request(url, headers={"User-Agent": "Haneoka-Data-Pipeline/0.1.0"}), timeout=45) as response:
+                  feed = json.load(response)
+              if not feed.get("masterHash") or not feed.get("publishedMaster") or (os.environ["KIND"] == "live2d" and not feed.get("models")) or (os.environ["KIND"] == "stories" and not feed.get("stories")):
+                  continue
+              identity = feed["masterSha256"] if os.environ["KIND"] == "masterdata" else feed["releaseId"]
+              if os.environ["KIND"] == "live2d":
+                  identity = feed["models"]["input"]
+              if os.environ["KIND"] == "stories":
+                  identity = feed["stories"]["input"]
+              version = {"version": feed["masterVersion"], "hash": feed["masterHash"]} if os.environ["KIND"] == "masterdata" else feed["publishedMaster"]
+              previous = manifest["servers"].get(server, {})
+              changed |= previous.get("input") != identity or any(previous.get(key) != value for key, value in version.items())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"changed={str(changed).lower()}\n")
+          print("Updated input" if changed else "All published inputs are unchanged")
+          PYTHON
+      - uses: actions/checkout@v7
+        if: steps.probe.outputs.changed == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        if: steps.probe.outputs.changed == 'true'
+        with:
+          repository: haneoka-gakuen/ournotes-data-pipeline
+          ref: ${{ inputs.producer_ref }}
+          path: .producer
+          persist-credentials: false
+      - name: Materialize and publish complete JP and Intl data
+        if: steps.probe.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ inputs.kind }}
+          FORCE: ${{ inputs.force }}
+          PUBLISH: ${{ inputs.publish }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          extra=()
+          if [[ "$FORCE" == "true" ]]; then extra+=(--force); fi
+          if [[ "$PUBLISH" != "true" ]]; then extra+=(--no-release); fi
+          python .producer/consume.py --kind "$KIND" "${extra[@]}"
